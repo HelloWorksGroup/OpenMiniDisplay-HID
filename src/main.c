@@ -14,6 +14,8 @@
 #include "pico/float.h"
 #include "pico/bootrom.h"
 
+#include "display_drv.h"
+
 critical_section_t scheduler_lock;
 static __inline void CRITICAL_REGION_INIT(void) {
 	critical_section_init(&scheduler_lock);
@@ -26,8 +28,15 @@ static __inline void CRITICAL_REGION_EXIT(void) {
 }
 
 bool timer_4hz_callback(struct repeating_timer* t) {
-	LOG_RAW("At %lld us:\n", time_us_64());
+	static uint8_t slower = 0;
+	if((++slower & 0x7) == 0) {
+		LOG_RAW("At %lld us:\n", time_us_64());
+	}
 	uevt_bc_e(UEVT_TIMER_4HZ);
+	return true;
+}
+bool timer_fps_callback(struct repeating_timer* t) {
+	uevt_bc_e(UEVT_TIMER_FPS);
 	return true;
 }
 
@@ -48,15 +57,47 @@ void led_blink_routine(void) {
 }
 
 void main_handler(uevt_t* evt) {
+	static uint32_t number = 0;
 	switch(evt->evt_id) {
 		case UEVT_TIMER_4HZ:
 			led_blink_routine();
+			break;
+		case UEVT_TIMER_FPS:
+			// display_number(number++);
 			break;
 	}
 }
 
 void uevt_log(char* str) {
 	LOG_RAW("%s\n", str);
+}
+
+void hid_parser(uint8_t const* buffer, uint16_t bufsize) {
+	if(buffer[0] != 0x5E) {
+		return;
+	}
+	uint8_t len = buffer[1];
+	// type 0xCD = command
+	if(buffer[2] == 0xCD) {
+		switch(buffer[3]) {
+			case 'n': // number
+				LOG_RAW("Display Number\n");
+				display_number(buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24));
+				break;
+			case 's': // string
+				LOG_RAW("Display String\n");
+				display_str((char*)&buffer[4], len - 2);
+				break;
+			case 'r': // raw
+				LOG_RAW("Display Raw\n");
+				display_raw(&buffer[4]);
+				break;
+			case 'y': // y
+				LOG_RAW("Display SET Y\n");
+				display_set_y(buffer[4]);
+				break;
+		}
+	}
 }
 
 const char printHex[] = "0123456789ABCDEF";
@@ -69,10 +110,11 @@ void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
 	}
 	// print first 32 bytes
 	LOG_RAW("HID[%d]:%s\n", bufsize, str);
+	hid_parser(buffer, bufsize);
 
 	uint8_t echo[64];
 	// echo back with every byte + 1
-	for (uint16_t i = 0; i < bufsize; i++) {
+	for(uint16_t i = 0; i < bufsize; i++) {
 		echo[i] = buffer[i] + 1;
 	}
 	hid_send(echo, bufsize);
@@ -104,6 +146,7 @@ void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 
 #include "hardware/xosc.h"
 extern void cdc_task(void);
+const char ready[] = "READY";
 int main() {
 	xosc_init();
 
@@ -113,8 +156,13 @@ int main() {
 	user_event_handler_regist(main_handler);
 
 	ws2812_setup();
+	display_init();
+	display_str(ready, 5);
+
 	struct repeating_timer timer;
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
+	struct repeating_timer timerFPS;
+	add_repeating_timer_us(16978ul, timer_fps_callback, NULL, &timerFPS);
 	tusb_init();
 	cdc_log_init();
 	while(true) {
